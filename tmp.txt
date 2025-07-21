@@ -1,0 +1,53 @@
+MDETR/
+├── .github/
+├── configs/
+├── datasets/  # 다양한 데이터셋(CLEVR, COCO, GQA 등)을 처리하는 로더 및 평가 관련 코드
+│   ├── phrasecut_utils/
+│   ├── __init__.py
+│   ├── clevr.py
+│   ├── clevrref.py
+│   ├── coco.py
+│   ├── coco_eval.py
+│   ├── flickr.py
+│   ├── flickr_eval.py
+│   ├── gqa.py
+│   ├── lvis.py
+│   ├── lvis_eval.py
+│   ├── lvis_modulation.py
+│   ├── mixed.py
+│   ├── phrasecut.py
+│   ├── phrasecut_eval.py
+│   ├── refexp.py
+│   ├── transforms.py
+│   └── vg.py
+├── models/  # MDETR의 핵심 모델 아키텍처 (백본, 트랜스포머, 매처, 세그멘테이션 등)
+│   ├── __init__.py
+│   ├── backbone.py  # 다양한 백본(ResNet, Timm 등)을 정의하고, 위치 인코딩을 결합해 특징 맵을 추출하는 역할
+│   ├── matcher.py  # 예측된 객체와 정답 객체 사이의 최적 1:1 매칭을 위해 Hungarian Algorithm 기반 매칭 비용을 계산하는 모듈
+│   ├── mdetr.py  # MDETR 모델의 전체 구조(백본, 트랜스포머, 객체 쿼리, 손실 함수 등) 정의
+│   ├── position_encoding.py  # 2D 이미지용 위치 인코딩(Position Embedding) 방식 정의
+│   ├── postprocessors.py  # MDETR 모델의 출력 결과를 데이터셋별 평가 형식에 맞게 후처리하는 모듈
+│   ├── segmentation.py  # MDETR의 마스크 예측과 손실 계산을 위한 mask head와 loss 함수를 정의한 모듈
+│   └── transformer.py  # 이미지와 텍스트를 함께 처리하기 위한 커스텀 Transformer 모듈
+├── scripts/  # 학습 및 파인튜닝, 실험 스크립트들
+│   ├── clevr/
+│   ├── fine-tuning/
+│   ├── pre-training/
+│   └── utils/
+├── util/  # 박스 연산, 분산 학습 도구, 시각화 등 유틸리티 함수들
+│   ├── __init__.py
+│   ├── box_ops.py  # 바운딩 박스 변환, IoU 및 GIoU 계산, 마스크로부터 박스 추출 등 박스 연산 유틸리티 정의
+│   ├── dist.py  # 분산 학습을 지원하기 위한 유틸리티 함수들(프로세스 초기화, all_gather, reduce, rank 확인 등) 정의
+│   ├── metrics.py  # 학습 중 지표 추적 및 로깅을 위한 유틸리티(SmoothedValue, MetricLogger, accuracy 등) 정의
+│   ├── misc.py  # 데이터 전처리, 배치 구성, Git 정보 추적, 텐서 보간 등 다양한 보조 유틸리티 함수들 정의
+│   ├── optim.py  # EMA 업데이트와 다양한 학습률 스케줄링 전략을 지원하는 최적화 유틸리티 함수들 정의
+│   └── plot_utils.py  # 학습 로그 및 평가 결과를 시각화하기 위한 그래프 유틸리티 함수들 정의
+├── engine.py
+├── hubconf.py
+├── LICENSE
+├── main.py  # 메인 실행 스크립트
+├── README.md  # 학습 엔진 (훈련 및 평가 루프 정의)
+├── requirements.txt  # 필요한 파이썬 패키지 명세
+├── run_with_submitit.py
+├── run_with_submitit_gqa_eval.py
+└── run_with_submitit_lvis_eval.py

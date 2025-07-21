@@ -29,6 +29,7 @@ from models import build_model
 from models.postprocessors import build_postprocessors
 
 
+# 커맨드라인 인자들을 정의하는 함수
 def get_args_parser():
     parser = argparse.ArgumentParser("Set transformer detector", add_help=False)
     parser.add_argument("--run_name", default="", type=str)
@@ -277,9 +278,13 @@ def get_args_parser():
 
 
 def main(args):
+    # 1단계: 환경 초기화 및 설정 불러오기
+
+    # 분산 학습 설정 (단일 GPU인 경우 내부적으로 무시됨)
     # Init distributed mode
     dist.init_distributed_mode(args)
 
+    # --dataset_config 파일(.json)에 정의된 설정들 로딩
     # Update dataset specific configs
     if args.dataset_config is not None:
         # https://stackoverflow.com/a/16878364
@@ -290,17 +295,20 @@ def main(args):
 
     print("git:\n  {}\n".format(utils.get_sha()))
 
+    # segmentation이 포함된 모델인 경우, segmentation 관련 옵션 처리
     # Segmentation related
     if args.mask_model != "none":
         args.masks = True
     if args.frozen_weights is not None:
         assert args.masks, "Frozen training is meant for segmentation only"
 
+    # 최종적으로 적용된 모든 설정값(args) 출력
     print(args)
 
-    device = torch.device(args.device)
-    output_dir = Path(args.output_dir)
+    device = torch.device(args.device) # 학습에 사용할 디바이스 설정
+    output_dir = Path(args.output_dir) # 결과 저장할 폴더 경로 지정
 
+    # seed 설정 (분산 학습일 경우 GPU마다 seed를 다르게)
     # fix the seed for reproducibility
     seed = args.seed + dist.get_rank()
     torch.manual_seed(seed)
@@ -308,23 +316,30 @@ def main(args):
     random.seed(seed)
     torch.set_deterministic(True)
 
+    # 2단계: 모델 구성 및 옵티마이저 설정
+
     # Build the model
-    model, criterion, contrastive_criterion, qa_criterion, weight_dict = build_model(args)
+    model, criterion, contrastive_criterion, qa_criterion, weight_dict = build_model(args) # 모델과 손실 함수들 생성
     model.to(device)
 
+    # detection 또는 QA 중 하나는 반드시 학습해야 한다는 조건
     assert (
         criterion is not None or qa_criterion is not None
     ), "Error: should train either detection or question answering (or both)"
 
     # Get a copy of the model for exponential moving averaged version of the model
-    model_ema = deepcopy(model) if args.ema else None
+    model_ema = deepcopy(model) if args.ema else None # EMA 모델 생성 (선택)
+    # 분산 학습 시 DDP (DistributedDataParallel) 래핑
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
+    # 전체 학습 가능한 파라미터 개수 출력
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("number of params:", n_parameters)
 
+    # 옵티마이저 설정
+    # 학습 파라미터를 그룹별로 나눠서 각각 다른 learning rate 적용: 일반 파라미터 → args.lr / backbone 관련 → args.lr_backbone / text_encoder 관련 → args.text_encoder_lr
     # Set up optimizers
     param_dicts = [
         {
@@ -343,6 +358,7 @@ def main(args):
             "lr": args.text_encoder_lr,
         },
     ]
+    # --optimizer 인자에 따라 적절한 optimizer 선택
     if args.optimizer == "sgd":
         optimizer = torch.optim.SGD(param_dicts, lr=args.lr, momentum=0.9, weight_decay=args.weight_decay)
     elif args.optimizer in ["adam", "adamw"]:
@@ -350,22 +366,26 @@ def main(args):
     else:
         raise RuntimeError(f"Unsupported optimizer {args.optimizer}")
 
+    # 3단계: 학습 & 검증 데이터셋 구성
+
+    # 학습 데이터셋 구성
     # Train dataset
     if len(args.combine_datasets) == 0 and not args.eval:
         raise RuntimeError("Please provide at least one training dataset")
 
     dataset_train, sampler_train, data_loader_train = None, None, None
-    if not args.eval:
+    if not args.eval: # --eval이 켜져 있지 않다면 (학습도 한다면) 학습용 데이터셋 준비
         dataset_train = ConcatDataset(
             [build_dataset(name, image_set="train", args=args) for name in args.combine_datasets]
-        )
+        ) # 여러 데이터셋을 묶어서 사용
 
         # To handle very big datasets, we chunk it into smaller parts.
-        if args.epoch_chunks > 0:
+        if args.epoch_chunks > 0: # epoch_chunks 설정 시, 데이터셋을 쪼개서 학습
             print(
                 "Splitting the training set into {args.epoch_chunks} of size approximately "
                 f" {len(dataset_train) // args.epoch_chunks}"
             )
+            # 데이터셋 인덱스를 나누고, 각 chunk마다 서브셋을 만들고 RandomSampler or DistributedSampler를 적용
             chunks = torch.chunk(torch.arange(len(dataset_train)), args.epoch_chunks)
             datasets = [torch.utils.data.Subset(dataset_train, chunk.tolist()) for chunk in chunks]
             if args.distributed:
@@ -373,6 +393,7 @@ def main(args):
             else:
                 samplers_train = [torch.utils.data.RandomSampler(ds) for ds in datasets]
 
+            # BatchSampler와 함께 DataLoader 생성
             batch_samplers_train = [
                 torch.utils.data.BatchSampler(sampler_train, args.batch_size, drop_last=True)
                 for sampler_train in samplers_train
@@ -387,7 +408,7 @@ def main(args):
                 )
                 for ds, batch_sampler_train in zip(datasets, batch_samplers_train)
             ]
-        else:
+        else: # 일반적인 경우, 하나의 전체 데이터셋으로 학습
             if args.distributed:
                 sampler_train = DistributedSampler(dataset_train)
             else:
@@ -401,6 +422,7 @@ def main(args):
                 num_workers=args.num_workers,
             )
 
+    # 검증 데이터셋 구성
     # Val dataset
     if len(args.combine_datasets_val) == 0:
         raise RuntimeError("Please provide at leas one validation dataset")
@@ -424,6 +446,10 @@ def main(args):
         base_ds = get_coco_api_from_dataset(dset)
         val_tuples.append(Val_all(dataset_name=dset_name, dataloader=dataloader, base_ds=base_ds, evaluator_list=None))
 
+    # 4단계: 체크포인트 로딩
+
+    # --frozen_weights: frozen segmentation용 weight 불러오기 (segmentation만 학습하고자 할 때 사용)
+    # DETR 부분만 불러와서 그대로 사용하고, mask head만 학습합니다
     if args.frozen_weights is not None:
         if args.resume.startswith("https"):
             checkpoint = torch.hub.load_state_dict_from_url(args.resume, map_location="cpu", check_hash=True)
@@ -437,6 +463,9 @@ def main(args):
         if args.ema:
             model_ema = deepcopy(model_without_ddp)
 
+    # --load: 전체 모델을 가져오되 새로 학습 시작하기
+    # 기존 pretrained 모델을 불러와서 가중치만 가져올 때 사용 (학습은 처음부터 시작) 
+    # epoch, optimizer 등은 가져오지 않음
     # Used for loading weights from another model and starting a training from scratch. Especially useful if
     # loading into a model with different functionality.
     if args.load:
@@ -450,6 +479,8 @@ def main(args):
         if args.ema:
             model_ema = deepcopy(model_without_ddp)
 
+    # --resume: 중단된 학습 이어서 하기
+    # 모델 가중치를 그대로 복구 & optimizer 상태, epoch 정보까지 복원해서 이어서 학습
     # Used for resuming training from the checkpoint of a model. Used when training times-out or is pre-empted.
     if args.resume:
         if args.resume.startswith("https"):
@@ -466,6 +497,8 @@ def main(args):
                 model_ema = deepcopy(model_without_ddp)
             else:
                 model_ema.load_state_dict(checkpoint["model_ema"])
+
+    # 5단계: 평가 전용 모드
 
     def build_evaluator_list(base_ds, dataset_name):
         """Helper function to build the list of evaluators for a given dataset"""
@@ -500,13 +533,15 @@ def main(args):
             )
         return evaluator_list
 
+    # --eval 설정 시 학습은 건너뛰고 평가만 수행
+    # model.eval() 모드가 자동으로 켜짐 (gradient 계산 X)
     # Runs only evaluation, by default on the validation set unless --test is passed.
     if args.eval:
         test_stats = {}
         test_model = model_ema if model_ema is not None else model
         for i, item in enumerate(val_tuples):
-            evaluator_list = build_evaluator_list(item.base_ds, item.dataset_name)
-            postprocessors = build_postprocessors(args, item.dataset_name)
+            evaluator_list = build_evaluator_list(item.base_ds, item.dataset_name) # 데이터셋별로 다른 evaluator 객체 생성
+            postprocessors = build_postprocessors(args, item.dataset_name) # 모델 출력 결과를 평가에 맞게 후처리하는 함수
             item = item._replace(evaluator_list=evaluator_list)
             print(f"Evaluating {item.dataset_name}")
             curr_test_stats = evaluate(
@@ -520,8 +555,8 @@ def main(args):
                 evaluator_list=item.evaluator_list,
                 device=device,
                 args=args,
-            )
-            test_stats.update({item.dataset_name + "_" + k: v for k, v in curr_test_stats.items()})
+            ) # 평가 실행
+            test_stats.update({item.dataset_name + "_" + k: v for k, v in curr_test_stats.items()}) # 전체 결과 저장
 
         log_stats = {
             **{f"test_{k}": v for k, v in test_stats.items()},
@@ -530,18 +565,21 @@ def main(args):
         print(log_stats)
         return
 
+    # 6단계: 학습 루프
+
     # Runs training and evaluates after every --eval_skip epochs
     print("Start training")
     start_time = time.time()
     best_metric = 0.0
+    # --start-epoch부터 --epochs까지 루프 돌며 학습 진행 (--resume 옵션이 있다면 중간부터 이어서 시작 가능)
     for epoch in range(args.start_epoch, args.epochs):
-        if args.epoch_chunks > 0:
+        if args.epoch_chunks > 0: # 데이터셋이 너무 크면 작은 조각으로 나눠 학습
             sampler_train = samplers_train[epoch % len(samplers_train)]
             data_loader_train = data_loaders_train[epoch % len(data_loaders_train)]
             print(f"Starting epoch {epoch // len(data_loaders_train)}, sub_epoch {epoch % len(data_loaders_train)}")
         else:
             print(f"Starting epoch {epoch}")
-        if args.distributed:
+        if args.distributed: # 분산 학습 시, 샘플러에 현재 epoch 정보 전달
             sampler_train.set_epoch(epoch)
         train_stats = train_one_epoch(
             model=model,
@@ -556,12 +594,15 @@ def main(args):
             args=args,
             max_norm=args.clip_max_norm,
             model_ema=model_ema,
-        )
+        ) # train_one_epoch 함수 호출
+        # 매 epoch 마다 checkpoint.pth 저장
         if args.output_dir:
             checkpoint_paths = [output_dir / "checkpoint.pth"]
+            # learning rate drop 시점이나 2의 배수 에폭에서는 추가 저장
             # extra checkpoint before LR drop and every 2 epochs
             if (epoch + 1) % args.lr_drop == 0 or (epoch + 1) % 2 == 0:
                 checkpoint_paths.append(output_dir / f"checkpoint{epoch:04}.pth")
+            # 현재 모델, optimizer, epoch 정보 등을 저장함
             for checkpoint_path in checkpoint_paths:
                 dist.save_on_master(
                     {
@@ -574,6 +615,8 @@ def main(args):
                     checkpoint_path,
                 )
 
+        # 검증 (평가) 실행
+        # --eval-skip 주기마다 val 데이터셋으로 평가 수행 (evaluate 함수 호출)
         if epoch % args.eval_skip == 0:
             test_stats = {}
             test_model = model_ema if model_ema is not None else model
@@ -598,6 +641,7 @@ def main(args):
         else:
             test_stats = {}
 
+        # 학습 결과(train_stats) + 평가 결과(test_stats) + 현재 epoch 기록
         log_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},
             **{f"test_{k}": v for k, v in test_stats.items()},
@@ -615,6 +659,7 @@ def main(args):
             else:
                 metric = np.mean([v[1] for k, v in test_stats.items() if "coco_eval_bbox" in k])
 
+            # 현재 성능이 지금까지 중 가장 좋다면 BEST_checkpoint.pth로 저장
             if args.output_dir and metric > best_metric:
                 best_metric = metric
                 checkpoint_paths = [output_dir / "BEST_checkpoint.pth"]
@@ -630,14 +675,15 @@ def main(args):
                         checkpoint_path,
                     )
 
+    # 전체 학습 시간 측정
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print("Training time {}".format(total_time_str))
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser("DETR training and evaluation script", parents=[get_args_parser()])
-    args = parser.parse_args()
-    if args.output_dir:
+if __name__ == "__main__": # 스크립트가 직접 실행될 때만 아래 블록이 실행되도록 (import 하는 경우에는 실행 X)
+    parser = argparse.ArgumentParser("DETR training and evaluation script", parents=[get_args_parser()]) # ArgumentParser 생성 (모든 커맨드라인 인자 정의 받아서 설정)
+    args = parser.parse_args() # 커맨드라인에서 넘긴 인자들을 파싱해서 args라는 객체로 저장
+    if args.output_dir: # --output-dir로 전달받은 경로가 존재하지 않으면 자동으로 폴더 생성
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    main(args)
+    main(args) # 방금 파싱한 args를 가지고 실제 학습/평가를 수행하는 main() 함수 호출

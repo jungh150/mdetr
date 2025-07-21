@@ -21,7 +21,7 @@ from util.metrics import MetricLogger, SmoothedValue
 from util.misc import targets_to
 from util.optim import adjust_learning_rate, update_ema
 
-
+# 학습 루프 함수: 입력받은 model, criterion, optimizer, data_loader 등을 통해 1 epoch의 학습 완결
 def train_one_epoch(
     model: torch.nn.Module,
     criterion: Optional[torch.nn.Module],
@@ -36,6 +36,7 @@ def train_one_epoch(
     max_norm: float = 0,
     model_ema: Optional[torch.nn.Module] = None,
 ):
+    # 모델과 사용되는 loss 함수들을 train 모드로 전환하고, 학습 도중 각종 지표(lr, loss, 등)를 기록할 logger 초기화
     model.train()
     if criterion is not None:
         criterion.train()
@@ -51,8 +52,11 @@ def train_one_epoch(
     print_freq = 10
 
     num_training_steps = int(len(data_loader) * args.epochs)
+    # data_loader를 통해 배치 단위로 데이터를 가져옴
     for i, batch_dict in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         curr_step = epoch * len(data_loader) + i
+        
+        # 이미지, 정답 박스 정보, 캡션 등 필수 데이터를 GPU로 이동시키고 정리
         samples = batch_dict["samples"].to(device)
         positive_map = batch_dict["positive_map"].to(device) if "positive_map" in batch_dict else None
         targets = batch_dict["targets"]
@@ -62,12 +66,16 @@ def train_one_epoch(
         targets = targets_to(targets, device)
 
         memory_cache = None
-        if args.masks:
-            outputs = model(samples, captions)
+        # 모델 forward (인코딩 + 디코딩)
+        # encode_and_save=True -> 인코딩 수행 & memory_cache 저장
+        # encode_and_save=False -> memory_cache 기반으로 디코딩 수행
+        if args.masks: # Segmentation 학습의 경우, 인코딩, 디코딩, 마스크 예측까지 전부 포함
+            outputs = model(samples, captions) # DETRsegm.forward(samples, captions) 호출
         else:
-            memory_cache = model(samples, captions, encode_and_save=True)
-            outputs = model(samples, captions, encode_and_save=False, memory_cache=memory_cache)
+            memory_cache = model(samples, captions, encode_and_save=True) # MDETR.forward(samples, captions, ...) 호출 -> 인코딩
+            outputs = model(samples, captions, encode_and_save=False, memory_cache=memory_cache) # MDETR.forward(samples, captions, ...) 호출 -> 디코딩
 
+        # 로스 항목별로 계산 후 가중치를 적용해서 전체 로스 산출
         loss_dict = {}
         if criterion is not None:
             loss_dict.update(criterion(outputs, targets, positive_map))
@@ -96,12 +104,14 @@ def train_one_epoch(
             print(loss_dict_reduced)
             sys.exit(1)
 
+        # 역전파 및 옵티마이저 업데이트
         optimizer.zero_grad()
         losses.backward()
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
 
+        # learning rate 스케줄링 & EMA 업데이트
         adjust_learning_rate(
             optimizer,
             epoch,
@@ -112,6 +122,7 @@ def train_one_epoch(
         if model_ema is not None:
             update_ema(model, model_ema, args.ema_decay)
 
+        # 로깅 & 통계 출력
         metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(lr_backbone=optimizer.param_groups[1]["lr"])
@@ -122,7 +133,8 @@ def train_one_epoch(
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-@torch.no_grad()
+# 평가 함수 (학습된 모델을 검증/테스트 데이터셋에 대해 평가)
+@torch.no_grad() # gradient 계산 X
 def evaluate(
     model: torch.nn.Module,
     criterion: Optional[torch.nn.Module],
@@ -135,6 +147,7 @@ def evaluate(
     device: torch.device,
     args,
 ):
+    # 모든 모듈을 eval 모드로 전환
     model.eval()
     if criterion is not None:
         criterion.eval()
@@ -146,7 +159,9 @@ def evaluate(
     metric_logger = MetricLogger(delimiter="  ")
     header = "Test:"
 
+    # 데이터셋 순회 (배치 단위 평가 루프)
     for batch_dict in metric_logger.log_every(data_loader, 10, header):
+        # 배치 데이터 준비
         samples = batch_dict["samples"].to(device)
         positive_map = batch_dict["positive_map"].to(device) if "positive_map" in batch_dict else None
         targets = batch_dict["targets"]
@@ -156,12 +171,16 @@ def evaluate(
         targets = targets_to(targets, device)
 
         memory_cache = None
-        if args.masks:
-            outputs = model(samples, captions)
+        # 모델 forward (인코딩 + 디코딩)
+        # encode_and_save=True -> 인코딩 수행 & memory_cache 저장
+        # encode_and_save=False -> memory_cache 기반으로 디코딩 수행
+        if args.masks: # Segmentation 학습의 경우, 인코딩, 디코딩, 마스크 예측까지 전부 포함
+            outputs = model(samples, captions) # DETRsegm.forward(samples, captions) 호출
         else:
-            memory_cache = model(samples, captions, encode_and_save=True)
-            outputs = model(samples, captions, encode_and_save=False, memory_cache=memory_cache)
+            memory_cache = model(samples, captions, encode_and_save=True) # MDETR.forward(samples, captions, ...) 호출 -> 인코딩
+            outputs = model(samples, captions, encode_and_save=False, memory_cache=memory_cache) # MDETR.forward(samples, captions, ...) 호출 -> 디코딩
 
+        # loss 계산 (optional)
         loss_dict = {}
         if criterion is not None:
             loss_dict.update(criterion(outputs, targets, positive_map))
@@ -185,6 +204,7 @@ def evaluate(
             **loss_dict_reduced_unscaled,
         )
 
+        # 예측 결과 후처리
         if not args.no_detection:
             orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
             results = postprocessors["bbox"](outputs, orig_target_sizes)
@@ -215,6 +235,7 @@ def evaluate(
 
             res = {target["image_id"].item(): output for target, output in zip(targets, results)}
 
+            # evaluator에 결과 업데이트
             for evaluator in evaluator_list:
                 if isinstance(evaluator, FlickrEvaluator):
                     evaluator.update(flickr_res)
@@ -223,6 +244,7 @@ def evaluate(
                 else:
                     evaluator.update(res)
 
+    # 결과 통합 및 요약
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -246,6 +268,7 @@ def evaluate(
 
     # accumulate predictions from all images
 
+    # 평가 결과 정리 및 반환
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     for evaluator in evaluator_list:
         if isinstance(evaluator, CocoEvaluator):

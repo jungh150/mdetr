@@ -49,15 +49,18 @@ class Transformer(nn.Module):
 
         self.CLS = nn.Embedding(1, d_model) if contrastive_loss else None
 
-        self._reset_parameters()
+        self._reset_parameters() # 파라미터 초기화
 
+        # 텍스트 인코더 (RoBERTa) 정의
         self.tokenizer = RobertaTokenizerFast.from_pretrained(text_encoder_type)
         self.text_encoder = RobertaModel.from_pretrained(text_encoder_type)
 
+        # RoBERTa를 파인튜닝 할지 말지
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
                 p.requires_grad_(False)
 
+        # 텍스트 feature 크기 맞추기
         self.expander_dropout = 0.1
         config = self.text_encoder.config
         self.resizer = FeatureResizer(
@@ -69,6 +72,7 @@ class Transformer(nn.Module):
         self.d_model = d_model
         self.nhead = nhead
 
+    # 파라미터 초기화 함수
     def _reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
@@ -86,7 +90,9 @@ class Transformer(nn.Module):
         img_memory=None,
         text_attention_mask=None,
     ):
+        # encode_and_save=True 모드: 이미지 + 텍스트를 인코딩하고 memory_cache를 반환
         if encode_and_save:
+            # 입력 이미지 전처리 (flatten & reshape)
             # flatten NxCxHxW to HWxNxC
             bs, c, h, w = src.shape
             src = src.flatten(2).permute(2, 0, 1)
@@ -95,6 +101,7 @@ class Transformer(nn.Module):
             query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
             mask = mask.flatten(1)
 
+            # CLS 토큰 추가 (contrastive learning 사용 시)
             if self.CLS is not None:
                 # We add a CLS token to the image, to be used for contrastive loss
 
@@ -109,11 +116,13 @@ class Transformer(nn.Module):
                 cls_pad = torch.zeros(bs, 1).bool().to(device)
                 mask = torch.cat((cls_pad, mask), dim=1)
 
+            # 디코더 입력 준비 (tgt 생성)
             if self.pass_pos_and_query:
                 tgt = torch.zeros_like(query_embed)
             else:
                 src, tgt, query_embed, pos_embed = src + 0.1 * pos_embed, query_embed, None, None
 
+            # 텍스트 인코딩
             device = src.device
             if isinstance(text[0], str):
                 # Encode the text
@@ -131,6 +140,7 @@ class Transformer(nn.Module):
                 # The text is already encoded, use as is.
                 text_attention_mask, text_memory_resized, tokenized = text
 
+            # 이미지 feature과 텍스트 feature을 concat
             # Concat on the sequence dimension
             src = torch.cat([src, text_memory_resized], dim=0)
             # For mask, sequence dimension is second
@@ -138,10 +148,12 @@ class Transformer(nn.Module):
             # Pad the pos_embed with 0 so that the addition will be a no-op for the text tokens
             pos_embed = torch.cat([pos_embed, torch.zeros_like(text_memory_resized)], dim=0)
 
+            # 인코더 실행
             img_memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
 
             text_memory = img_memory[-len(text_memory_resized) :]
 
+            # 결과 저장 및 반환
             assert img_memory.shape[1] == text_memory.shape[1] == tgt.shape[1]
             memory_cache = {
                 "text_memory_resized": text_memory_resized,
@@ -157,6 +169,7 @@ class Transformer(nn.Module):
             }
             return memory_cache
 
+        # encode_and_save=False 모드: 인코딩된 memory_cache를 받아 디코더 실행 (query 예측)
         else:
             if self.pass_pos_and_query:
                 tgt = torch.zeros_like(query_embed)
@@ -165,6 +178,7 @@ class Transformer(nn.Module):
 
             assert img_memory.shape[1] == text_memory.shape[1] == tgt.shape[1]
 
+            # 디코더 실행
             hs = self.decoder(
                 tgt,
                 img_memory,
@@ -177,6 +191,7 @@ class Transformer(nn.Module):
             return hs.transpose(1, 2)
 
 
+# 여러 층의 TransformerEncoderLayer를 순차적으로 적용하여 입력 시퀀스(이미지 + 텍스트)를 인코딩하는 클래스
 class TransformerEncoder(nn.Module):
     def __init__(self, encoder_layer, num_layers, norm=None):
         super().__init__()
@@ -203,6 +218,7 @@ class TransformerEncoder(nn.Module):
         return output
 
 
+# 여러 층의 TransformerDecoderLayer를 통해, object query를 받아 이미지/텍스트 memory로부터 cross-attention 기반 정보 추론을 수행하는 클래스
 class TransformerDecoder(nn.Module):
     def __init__(self, decoder_layer, num_layers, norm=None, return_intermediate=False):
         super().__init__()
@@ -276,6 +292,7 @@ class TransformerEncoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
+    # 순서: 입력 전체(src)에 대해 Self-Attention -> FFN
     def forward_post(
         self,
         src,
@@ -308,6 +325,8 @@ class TransformerEncoderLayer(nn.Module):
         src = src + self.dropout2(src2)
         return src
 
+    # LayerNorm 위치를 Residual 뒤로 할지, 앞으로 할지에 따라 각각 forward_post 함수, forward_pre 함수 호출
+    # 기본: Residual 뒤 => forward_post
     def forward(
         self,
         src,
@@ -347,6 +366,7 @@ class TransformerDecoderLayer(nn.Module):
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
 
+    # 순서: Self-attention on tgt -> Cross-attention with memory (image) -> Feed Forward Network (FFN)
     # For now, trying one version where its self attn -> cross attn text -> cross attn image -> FFN
     def forward_post(
         self,
@@ -428,6 +448,8 @@ class TransformerDecoderLayer(nn.Module):
         tgt = tgt + self.dropout3(tgt2)
         return tgt
 
+    # LayerNorm 위치를 Residual 뒤로 할지, 앞으로 할지에 따라 각각 forward_post 함수, forward_pre 함수 호출
+    # 기본: Residual 뒤 => forward_post
     def forward(
         self,
         tgt,
