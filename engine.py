@@ -77,18 +77,23 @@ def train_one_epoch(
 
         # 로스 항목별로 계산 후 가중치를 적용해서 전체 로스 산출
         loss_dict = {}
+
+        # Detection용 기본 criterion 호출 (SetCriterion)
         if criterion is not None:
             loss_dict.update(criterion(outputs, targets, positive_map))
 
+        # 대조학습(contrastive loss) 부분 (ContrastiveCriterion)
         if contrastive_criterion is not None:
             assert memory_cache is not None
             contrastive_loss = contrastive_criterion(memory_cache["text_pooled_op"], memory_cache["img_pooled_op"])
             loss_dict["contrastive_loss"] = contrastive_loss
 
+        # 질문-답변(Question Answering)용 손실 (QACriterionGQA/QACriterionClevr)
         if qa_criterion is not None:
             answer_losses = qa_criterion(outputs, answers)
             loss_dict.update(answer_losses)
 
+        # 최종 학습에 사용할 전체 손실 값 계산
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
         # reduce losses over all GPUs for logging purposes
@@ -106,7 +111,7 @@ def train_one_epoch(
 
         # 역전파 및 옵티마이저 업데이트
         optimizer.zero_grad()
-        losses.backward()
+        losses.backward()  # 가중치 업데이트
         if max_norm > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         optimizer.step()
